@@ -264,13 +264,20 @@ def extract_features(props, labeled, smooth_f, smoothed_uint8, edge_combined,
                 feat.append(float(np.mean(np.abs(vals))) if vals.size else 0.0)
         gabor_list.append(feat)
 
-        # --- HOG (unchanged) ---
+        # --- HOG ---
         bb = p.bbox
         reg = smoothed_uint8[bb[0]:bb[2], bb[1]:bb[3]]
         if reg.size == 0:
             reg = np.zeros((64, 64), dtype=np.uint8)
         reg64 = transform.resize(reg, (64, 64), anti_aliasing=True)
-        hog_list.append(hog(reg64, orientations=9, pixels_per_cell=(8, 8),
+        # NOTE: pixels_per_cell=(16,16) here (not the finer (8,8)) is a deliberate choice.
+        # On a small 64x64 patch, (8,8) cells produce 1,764 HOG dimensions ALONE -- by far
+        # the largest contributor to feature-vector size, which directly drives RAM usage
+        # across thousands of regions, and risks overfitting given how few positive
+        # (real-fracture) training examples exist relative to that many dimensions.
+        # (16,16) cells give 324 dimensions -- still captures the gradient/shape structure
+        # relevant at this patch size, at ~1/5th the memory cost.
+        hog_list.append(hog(reg64, orientations=9, pixels_per_cell=(16, 16),
                              cells_per_block=(2, 2), block_norm='L2-Hys'))
 
         # --- NEW: GLCM texture features ---

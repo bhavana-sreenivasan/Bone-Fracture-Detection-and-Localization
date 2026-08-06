@@ -224,7 +224,13 @@ def main():
         "class_weight": ["balanced"],  # fracture regions are the minority class -- important
     }
     cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=CONFIG["randomSeed"])
-    grid = GridSearchCV(RandomForestClassifier(random_state=CONFIG["randomSeed"], n_jobs=-1),
+    # IMPORTANT: n_jobs=-1 lives on GridSearchCV only. Also setting n_jobs=-1 on
+    # RandomForestClassifier would cause nested parallelism (each CV fold spawning
+    # its own set of parallel workers inside an already-parallel outer loop),
+    # which multiplies memory usage (each worker needs its own copy of the training
+    # data) without actually running faster on a 2-4 core machine. n_jobs=1 here
+    # keeps memory bounded and lets GridSearchCV be the only parallelism layer.
+    grid = GridSearchCV(RandomForestClassifier(random_state=CONFIG["randomSeed"], n_jobs=1),
                          param_grid, scoring="f1", cv=cv, n_jobs=-1)
     grid.fit(X_train, y_train)
     clf = grid.best_estimator_

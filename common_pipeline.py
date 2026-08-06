@@ -315,12 +315,17 @@ def extract_features(props, labeled, smooth_f, smoothed_uint8, edge_combined,
 # NMS (unchanged logic, factored out so both train/eval scripts share it)
 # ----------------------------------------------------------------------
 
-def apply_nms(props, is_fracture_mask, confidence, nms_distance):
+def apply_nms(centroids_xy, is_fracture_mask, confidence, nms_distance):
+    """
+    centroids_xy: array of shape [n_regions, 2] with (x, y) centroid of each region
+                  (plain numpy array, NOT skimage region objects -- keeps this
+                  function safe to use with results that crossed a process boundary).
+    """
     frac_idx = np.where(is_fracture_mask)[0]
     if len(frac_idx) <= 1:
         return is_fracture_mask
 
-    centroids = np.array([props[i].centroid[::-1] for i in frac_idx])
+    centroids = np.asarray(centroids_xy)[frac_idx]
     keep = np.ones(len(frac_idx), dtype=bool)
     for i in range(len(frac_idx)):
         if not keep[i]:

@@ -19,14 +19,18 @@ import json
 import joblib
 import numpy as np
 import pandas as pd
+import multiprocessing as mp
 
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 
 from common_pipeline import (load_coco_ground_truth, detect_candidate_regions,
                               region_bbox_to_xyxy, iou_xyxy)
+
+NUM_WORKERS = max(1, mp.cpu_count() - 1)  # leave 1 core free for the OS/main process
 
 CONFIG = {
     "imagesFolder_fractured":     "FracAtlas/images/Fractured",
@@ -88,36 +92,62 @@ def match_regions_to_ground_truth(det_result, gt_boxes_orig, scale, iou_thresh):
     return region_labels, len(matched_gt)
 
 
-def build_training_table(image_list, gt_dict, config):
+def _process_one_image(args):
     """
-    Runs candidate detection on every image in image_list, matches regions
-    to ground truth, and returns a stacked feature matrix + label vector,
-    plus diagnostics (candidate recall = fraction of real GT fractures that
-    the classical CV step even proposed a region for -- this is the ceiling
-    on what any classifier trained on these candidates can achieve).
+    Top-level (picklable) worker function -- runs in a separate process.
+    Does candidate detection + IoU label matching for ONE image and returns
+    a small, easily-serialized result instead of the full det dict.
     """
+    img_path, gt_boxes, config = args
+    fname = Path(img_path).name
+    det = detect_candidate_regions(str(img_path), config)
+    if det["status"] != "ok" or det["features"] is None:
+        return {"image": fname, "status": det["status"], "features": None, "labels": None, "n_matched": 0}
+
+    labels, n_matched = match_regions_to_ground_truth(det, gt_boxes, det["scale"], config["iouMatchThreshold"])
+    return {"image": fname, "status": "ok", "features": det["features"], "labels": labels, "n_matched": n_matched}
+
+
+def build_training_table(image_list, gt_dict, config, num_workers=None):
+    """
+    Runs candidate detection on every image in image_list IN PARALLEL across
+    CPU cores, matches regions to ground truth, and returns a stacked
+    feature matrix + label vector, plus diagnostics (candidate recall =
+    fraction of real GT fractures that the classical CV step even proposed
+    a region for -- this is the ceiling on what any classifier trained on
+    these candidates can achieve).
+    """
+    num_workers = num_workers or NUM_WORKERS
     X_parts, y_parts = [], []
     total_gt_boxes = 0
     total_gt_matched = 0
     per_image_log = []
 
+    tasks = []
     for img_path, img_level_label in image_list:
-        fname = img_path.name
-        gt_boxes = gt_dict.get(fname, [])  # empty list for non-fractured / unannotated images
+        gt_boxes = gt_dict.get(img_path.name, [])
         total_gt_boxes += len(gt_boxes)
+        tasks.append((str(img_path), gt_boxes, config))
 
-        det = detect_candidate_regions(str(img_path), config)
-        if det["status"] != "ok" or det["features"] is None:
-            per_image_log.append({"image": fname, "status": det["status"], "n_regions": 0})
-            continue
+    done = 0
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [executor.submit(_process_one_image, t) for t in tasks]
+        for fut in as_completed(futures):
+            result = fut.result()
+            done += 1
+            if done % 200 == 0 or done == len(futures):
+                print(f"    processed {done}/{len(futures)} images...")
 
-        labels, n_matched = match_regions_to_ground_truth(det, gt_boxes, det["scale"], config["iouMatchThreshold"])
-        total_gt_matched += n_matched
+            if result["status"] != "ok":
+                per_image_log.append({"image": result["image"], "status": result["status"], "n_regions": 0})
+                continue
 
-        X_parts.append(det["features"])
-        y_parts.append(labels)
-        per_image_log.append({"image": fname, "status": "ok",
-                               "n_regions": len(labels), "n_positive": int(labels.sum())})
+            total_gt_matched += result["n_matched"]
+            X_parts.append(result["features"])
+            y_parts.append(result["labels"])
+            per_image_log.append({"image": result["image"], "status": "ok",
+                                   "n_regions": len(result["labels"]),
+                                   "n_positive": int(result["labels"].sum())})
 
     X = np.vstack(X_parts) if X_parts else np.empty((0, 0))
     y = np.concatenate(y_parts) if y_parts else np.array([])

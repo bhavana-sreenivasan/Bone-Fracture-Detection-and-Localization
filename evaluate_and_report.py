@@ -17,8 +17,10 @@ import json
 import joblib
 import numpy as np
 import pandas as pd
+import multiprocessing as mp
 
 from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from sklearn.metrics import confusion_matrix, precision_score, recall_score, f1_score
 
 from common_pipeline import load_coco_ground_truth, region_bbox_to_xyxy, iou_xyxy, apply_nms
@@ -26,6 +28,32 @@ from train_and_tune import CONFIG as TRAIN_CONFIG, match_regions_to_ground_truth
 from common_pipeline import detect_candidate_regions
 
 OUT_DIR = Path(TRAIN_CONFIG["outputFolder"])
+NUM_WORKERS = max(1, mp.cpu_count() - 1)
+
+
+def _detect_one_test_image(args):
+    """
+    Picklable worker: runs the (slow, CPU-heavy) candidate detection +
+    ground-truth label matching for ONE image. Returns only plain, easily
+    serialized data (no skimage region objects) so results can safely cross
+    the process boundary back to the main process, where the fast
+    model.predict_proba() step happens.
+    """
+    img_path, gt_boxes_orig, config, iou_thresh = args
+    fname = Path(img_path).name
+    det = detect_candidate_regions(str(img_path), config)
+    if det["status"] != "ok" or det["features"] is None:
+        return {"image": fname, "status": det["status"], "gt_boxes_orig": gt_boxes_orig}
+
+    true_labels, _ = match_regions_to_ground_truth(det, gt_boxes_orig, det["scale"], iou_thresh)
+    centroids_xy = np.array([p.centroid[::-1] for p in det["props"]])  # (x, y) per region
+    bboxes_xyxy = [region_bbox_to_xyxy(p.bbox) for p in det["props"]]
+
+    return {
+        "image": fname, "status": "ok", "gt_boxes_orig": gt_boxes_orig,
+        "scale": det["scale"], "features": det["features"], "true_labels": true_labels,
+        "centroids_xy": centroids_xy, "bboxes_xyxy": bboxes_xyxy,
+    }
 
 
 def main():
@@ -35,6 +63,7 @@ def main():
         split = json.load(f)
     test_paths = [Path(p) for p in split["test"]]
     print(f"Evaluating on {len(test_paths)} held-out TEST images (never seen during training/tuning).")
+    print(f"Running candidate detection across {NUM_WORKERS} worker processes...")
 
     clf = joblib.load(OUT_DIR / "fracture_classifier.joblib")
     with open(OUT_DIR / "tuned_threshold.json") as f:
@@ -44,53 +73,55 @@ def main():
     region_y_true, region_y_pred = [], []
     image_rows = []
 
-    for img_path in test_paths:
-        fname = img_path.name
-        gt_boxes_orig = gt_dict.get(fname, [])
-        image_is_fractured_gt = len(gt_boxes_orig) > 0
+    tasks = [(str(p), gt_dict.get(p.name, []), TRAIN_CONFIG, TRAIN_CONFIG["iouMatchThreshold"])
+             for p in test_paths]
 
-        det = detect_candidate_regions(str(img_path), TRAIN_CONFIG)
-        if det["status"] != "ok" or det["features"] is None:
-            # No candidate regions proposed at all.
+    done = 0
+    with ProcessPoolExecutor(max_workers=NUM_WORKERS) as executor:
+        futures = [executor.submit(_detect_one_test_image, t) for t in tasks]
+        for fut in as_completed(futures):
+            r = fut.result()
+            done += 1
+            if done % 100 == 0 or done == len(futures):
+                print(f"    processed {done}/{len(futures)} images...")
+
+            fname = r["image"]
+            gt_boxes_orig = r["gt_boxes_orig"]
+            image_is_fractured_gt = len(gt_boxes_orig) > 0
+
+            if r["status"] != "ok":
+                image_rows.append({
+                    "image": fname, "gt_fractured": image_is_fractured_gt,
+                    "pred_fractured": False, "n_gt_boxes": len(gt_boxes_orig),
+                    "n_predicted_regions": 0, "mean_iou_of_matches": None,
+                })
+                continue
+
+            # Fast step -- runs in the main process, negligible cost vs. detection
+            probs = clf.predict_proba(r["features"])[:, 1]
+            pred_labels = (probs >= conf_thresh).astype(int)
+            pred_mask = apply_nms(r["centroids_xy"], pred_labels.astype(bool), probs, nms_distance=30)
+
+            region_y_true.extend(r["true_labels"].tolist())
+            region_y_pred.extend(pred_mask.astype(int).tolist())
+
+            image_pred_fractured = bool(pred_mask.any())
+
+            ious = []
+            if image_is_fractured_gt:
+                gt_scaled = [[c * r["scale"] for c in b] for b in gt_boxes_orig]
+                for i, is_pos in enumerate(pred_mask):
+                    if not is_pos:
+                        continue
+                    best = max((iou_xyxy(r["bboxes_xyxy"][i], g) for g in gt_scaled), default=0.0)
+                    ious.append(best)
+
             image_rows.append({
                 "image": fname, "gt_fractured": image_is_fractured_gt,
-                "pred_fractured": False, "n_gt_boxes": len(gt_boxes_orig),
-                "n_predicted_regions": 0, "mean_iou_of_matches": None,
+                "pred_fractured": image_pred_fractured, "n_gt_boxes": len(gt_boxes_orig),
+                "n_predicted_regions": int(pred_mask.sum()),
+                "mean_iou_of_matches": float(np.mean(ious)) if ious else None,
             })
-            continue
-
-        # True region labels (for computing region-level precision/recall against GT)
-        true_labels, _ = match_regions_to_ground_truth(
-            det, gt_boxes_orig, det["scale"], TRAIN_CONFIG["iouMatchThreshold"])
-
-        # Model prediction
-        probs = clf.predict_proba(det["features"])[:, 1]
-        pred_labels = (probs >= conf_thresh).astype(int)
-        pred_mask = apply_nms(det["props"], pred_labels.astype(bool), probs, nms_distance=30)
-
-        region_y_true.extend(true_labels.tolist())
-        region_y_pred.extend(pred_mask.astype(int).tolist())
-
-        # Image-level: did the model predict ANY fracture in this image?
-        image_pred_fractured = bool(pred_mask.any())
-
-        # Mean IoU of predicted-positive regions against their best-matching GT box
-        ious = []
-        if image_is_fractured_gt:
-            gt_scaled = [[c * det["scale"] for c in b] for b in gt_boxes_orig]
-            for i, is_pos in enumerate(pred_mask):
-                if not is_pos:
-                    continue
-                rbox = region_bbox_to_xyxy(det["props"][i].bbox)
-                best = max((iou_xyxy(rbox, g) for g in gt_scaled), default=0.0)
-                ious.append(best)
-
-        image_rows.append({
-            "image": fname, "gt_fractured": image_is_fractured_gt,
-            "pred_fractured": image_pred_fractured, "n_gt_boxes": len(gt_boxes_orig),
-            "n_predicted_regions": int(pred_mask.sum()),
-            "mean_iou_of_matches": float(np.mean(ious)) if ious else None,
-        })
 
     # ---------------- REGION-LEVEL METRICS ----------------
     region_y_true = np.array(region_y_true)

@@ -45,6 +45,24 @@ Ran a controlled ablation: trained the exact same model configuration on raw ima
 
 **Finding:** CLAHE preprocessing did not help, and modestly hurt, detection performance for YOLOv8 on this dataset — contradicting the intuition carried over from the classical CV (Random Forest) version of this project, where CLAHE + denoising was a meaningful contributor. This suggests CNN-based detectors can already learn useful contrast-invariant features on their own, and manual contrast enhancement may introduce artifacts (denoising, edge softening) that work against a model already handling that internally.
 
+## Deployment
+
+The trained model was exported and benchmarked across formats to evaluate inference optimization tradeoffs, then deployed as a live, interactive demo:
+
+| Export format | Inference latency |
+|---|---|
+| PyTorch (.pt) | 16.1ms |
+| ONNX (CPU) | 405.9ms |
+| TensorRT FP16 (.engine) | 12.1ms |
+
+TensorRT FP16 quantization gave a ~25% speedup over the raw PyTorch model, at the cost of a small, expected accuracy tradeoff from reduced precision. Full export code and benchmarking methodology are in [`deployment/export_benchmark_deployment.ipynb`](deployment/export_benchmark_deployment.ipynb).
+
+The live demo itself is deployed on **Hugging Face Spaces** using the original PyTorch weights (not the TensorRT engine, which is hardware-specific and not portable across environments) served via ZeroGPU:
+
+**[Try the live demo →](https://huggingface.co/spaces/bhavanahh/fracture-detection-demo)**
+
+Upload an X-ray and get back a bounding box around any detected fracture, with a confidence score.
+
 ## Results
 
 **Best model:** Baseline (no CLAHE), selected by mean mAP@0.5 across seeds.

@@ -62,7 +62,13 @@ The live demo itself is deployed on **Hugging Face Spaces** using the original P
 **[Try the live demo →](https://huggingface.co/spaces/bhavanahh/fracture-detection-demo)**
 
 Upload an X-ray and get back a bounding box around any detected fracture, with a confidence score.
+### Example results
 
+![True positive detection](images/demo_true_positive.jpeg)
+*Correctly localized fracture (confidence 0.64), verified against ground truth annotation (IoU = 0.49)*
+
+![True negative result](images/demo_true_negative.jpeg)
+*Clean X-ray correctly returns no detection*
 ## Results
 
 **Best model:** Baseline (no CLAHE), selected by mean mAP@0.5 across seeds.

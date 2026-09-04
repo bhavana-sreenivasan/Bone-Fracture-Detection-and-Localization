@@ -64,10 +64,10 @@ The live demo itself is deployed on **Hugging Face Spaces** using the original P
 Upload an X-ray and get back a bounding box around any detected fracture, with a confidence score.
 ### Example results
 
-![True positive detection](images/demo_true_positive.jpeg)
+![True positive detection](images/true_positive.jpeg)
 *Correctly localized fracture (confidence 0.64), verified against ground truth annotation (IoU = 0.49)*
 
-![True negative result](images/demo_true_negative.jpeg)
+![True negative result](images/true_negative.jpeg)
 *Clean X-ray correctly returns no detection*
 ## Results
 
